@@ -8,7 +8,7 @@ What this file does:
 - Draw a fixed header and 5 body lines onto an image
 - Show that image on the screen using partial or full refresh as appropriate
 - Limit how often the screen refreshes
-- Force a refresh when VLAN or VOICE changes
+- Force a refresh when VLAN changes
 - Manage ghosting by forcing a full refresh every N partial refreshes
 - Put the display to sleep when appropriate
 
@@ -224,7 +224,7 @@ class EPaperDisplay:
             if not force and normalized_lines == self.last_lines and protocol_label == self._last_protocol:
                 return False
 
-            # VLAN or VOICE changes always trigger an immediate refresh,
+            # VLAN changes always trigger an immediate refresh,
             # bypassing the normal minimum refresh interval.
             if self._important_fields_changed(normalized_lines):
                 force = True
@@ -391,19 +391,15 @@ class EPaperDisplay:
 
     def _important_fields_changed(self, new_lines):
         """
-        Check whether VLAN (index 3), VOICE (index 4), or LINK (index 5) changed.
+        Check whether VLAN (index 3) changed.
 
-        These fields trigger an immediate refresh, bypassing the normal
+        This field triggers an immediate refresh, bypassing the normal
         minimum refresh interval, so the technician sees changes right away.
         """
         if self.last_lines is None:
             return True
 
-        return (
-            self.last_lines[3] != new_lines[3]
-            or self.last_lines[4] != new_lines[4]
-            or self.last_lines[5] != new_lines[5]
-        )
+        return self.last_lines[3] != new_lines[3]
 
     def _refresh_allowed(self):
         """

@@ -27,8 +27,8 @@ from waveshare_lcd import LCD_1in44
 from parse_utils import normalize_display_lines, shorten_interface_name
 
 
-# Index of the PORT line within the 6 body lines passed to show_lines.
-# SW=0, IP=1, PORT=2, VLAN=3, VOICE=4, LINK=5
+# Index of the PORT line within the body lines passed to show_lines.
+# SW=0, IP=1, PORT=2, VLAN=3
 _PORT_LINE_INDEX = 2
 
 
