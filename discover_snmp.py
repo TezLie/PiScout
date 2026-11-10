@@ -42,6 +42,7 @@ What this file does NOT do:
 from __future__ import annotations
 
 import logging
+import re
 import shutil
 import socket
 import struct
@@ -79,6 +80,7 @@ if not _SNMP_AVAILABLE:
 
 _OID_SYS_NAME            = "1.3.6.1.2.1.1.5.0"
 _OID_IF_DESCR            = "1.3.6.1.2.1.2.2.1.2"
+_OID_IF_ALIAS            = "1.3.6.1.2.1.31.1.1.1.18"
 _OID_BRIDGE_FDB_PORT     = "1.3.6.1.2.1.17.4.3.1.2"
 _OID_BRIDGE_PORT_IFIDX   = "1.3.6.1.2.1.17.1.4.1.2"
 _OID_CDP_CACHE_DEVICE_ID = "1.3.6.1.4.1.9.9.23.1.2.1.1.6"
@@ -89,7 +91,11 @@ _OID_CISCO_VOICE_VLAN    = "1.3.6.1.4.1.9.9.432.1.1.1.1.2"
 _OID_DOT1Q_PVID          = "1.3.6.1.2.1.17.7.1.4.5.1.1"
 _OID_VTP_VLAN_STATE      = "1.3.6.1.4.1.9.9.46.1.3.1.1.2"
 _OID_LLDP_REM_SYS_NAME  = "1.0.8802.1.1.2.1.4.1.1.9"
+_OID_LLDP_LOC_PORT_ID   = "1.0.8802.1.1.2.1.3.7.1.3"
 _OID_LLDP_LOC_PORT_DESC = "1.0.8802.1.1.2.1.3.7.1.4"
+
+# Hex MAC as printed by snmpget, e.g. "00 1A 2B 3C 4D 5E" or "0:1a:2b:3c:4d:5e".
+_MAC_LIKE = re.compile(r"^[0-9A-Fa-f]{1,2}([ :-][0-9A-Fa-f]{1,2}){5}$")
 
 
 # ============================================================
@@ -490,11 +496,13 @@ def _find_port_cdp_mib(
         )
 
         port_name   = _snmp_get(host, community, f"{_OID_IF_DESCR}.{if_index}")
+        port_desc   = _snmp_get(host, community, f"{_OID_IF_ALIAS}.{if_index}")
         native_vlan = _snmp_get(host, community, f"{_OID_CDP_NATIVE_VLAN}.{if_index}.{device_index}")
         voice_vlan  = _snmp_get(host, community, f"{_OID_CDP_VOICE_VLAN}.{if_index}.{device_index}")
 
         return {
             "port_name":  str(port_name  or "").strip(),
+            "port_desc":  str(port_desc  or "").strip(),
             "vlan":       str(native_vlan or "").strip(),
             "voice_vlan": str(voice_vlan  or "").strip(),
         }
@@ -534,8 +542,14 @@ def _find_port_lldp_mib(
 
         log.debug("SNMP: LLDP-MIB found %s at localPortNum=%d", hostname, local_port_num)
 
-        port_desc  = _snmp_get(host, community, f"{_OID_LLDP_LOC_PORT_DESC}.{local_port_num}")
-        port_name  = str(port_desc or f"port{local_port_num}").strip()
+        port_id    = str(_snmp_get(host, community, f"{_OID_LLDP_LOC_PORT_ID}.{local_port_num}") or "").strip()
+        port_desc  = str(_snmp_get(host, community, f"{_OID_LLDP_LOC_PORT_DESC}.{local_port_num}") or "").strip()
+        if port_id and not _MAC_LIKE.match(port_id):
+            port_name = port_id
+        else:
+            # MAC-based or missing Port ID — fall back to the description.
+            port_name = port_desc or f"port{local_port_num}"
+            port_desc = ""
 
         # Try VLAN — assume localPortNum equals ifIndex on most switches.
         if_index   = local_port_num
@@ -545,6 +559,7 @@ def _find_port_lldp_mib(
 
         return {
             "port_name":  port_name,
+            "port_desc":  port_desc,
             "vlan":       vlan,
             "voice_vlan": "",
         }
@@ -632,6 +647,7 @@ def _find_port_bridge_mib(
         return None
 
     port_name   = _snmp_get(host, community, f"{_OID_IF_DESCR}.{if_index}")
+    port_desc   = _snmp_get(host, community, f"{_OID_IF_ALIAS}.{if_index}")
     cisco_vlan  = _snmp_get(host, community, f"{_OID_CISCO_VM_VLAN}.{if_index}")
     voice_vlan  = _snmp_get(host, community, f"{_OID_CISCO_VOICE_VLAN}.{if_index}")
 
@@ -641,6 +657,7 @@ def _find_port_bridge_mib(
 
     return {
         "port_name":  str(port_name  or "").strip(),
+        "port_desc":  str(port_desc  or "").strip(),
         "vlan":       vlan,
         "voice_vlan": str(voice_vlan or "").strip(),
     }
@@ -701,6 +718,7 @@ def _query_switch(
         return None
 
     port_name = parse_utils.shorten_interface_name(port_info.get("port_name", ""))
+    port_desc = parse_utils.clean_port_description(port_info.get("port_desc", ""), port_name)
     vlan      = parse_utils.normalize_vlan_value(port_info.get("vlan", ""))
     voice     = parse_utils.normalize_vlan_value(port_info.get("voice_vlan", ""))
 
@@ -713,15 +731,17 @@ def _query_switch(
         "switch_name": switch_name,
         "switch_ip":   gateway,
         "port":        port_name,
+        "port_desc":   port_desc,
         "vlan":        vlan,
         "voice_vlan":  voice,
     }
 
     log.info(
-        "SNMP discovery success | switch=%s ip=%s port=%s vlan=%s voice=%s",
+        "SNMP discovery success | switch=%s ip=%s port=%s desc=%s vlan=%s voice=%s",
         result["switch_name"],
         result["switch_ip"],
         result["port"],
+        result["port_desc"],
         result["vlan"],
         result["voice_vlan"],
     )

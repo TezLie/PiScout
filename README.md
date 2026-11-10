@@ -42,6 +42,7 @@ The goal was to build a practical, open-source alternative to expensive commerci
 SW: SWITCH-01
 IP: 10.10.1.2
 PORT: Gi1/0/24
+DESC: Room 214 desk
 VLAN: 120
 ```
 
@@ -100,6 +101,7 @@ The following information is shown on the e-Paper display:
 - **SW** — Switch hostname
 - **IP** — Switch management IP address
 - **PORT** — Port the device is connected to
+- **DESC** — Description configured on the switch port (blank if none; CDP never provides one)
 - **VLAN** — Access VLAN
 
 A small protocol indicator in the top-right corner shows which discovery method produced the result: **SNMP**, **LLDP**, or **CDP**.
@@ -405,10 +407,11 @@ Example output:
 ```json
 {
   "timestamp": "2026-04-30 15:18:09",
-  "protocol": "CDP",
+  "protocol": "LLDP",
   "switch_name": "S4-TENFLO-MDF",
   "switch_ip": "10.126.0.4",
   "port": "Gi1/0/31",
+  "port_desc": "Room 214 desk",
   "vlan": "2001",
   "voice_vlan": "3032"
 }

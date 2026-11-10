@@ -109,6 +109,7 @@ def _build_entry(result: dict) -> dict:
         "switch_name": result.get("switch_name", ""),
         "switch_ip":   result.get("switch_ip",   ""),
         "port":        result.get("port",        ""),
+        "port_desc":   result.get("port_desc",   ""),
         "vlan":        result.get("vlan",        ""),
         "voice_vlan":  result.get("voice_vlan",  ""),
     }
@@ -243,11 +244,12 @@ def _record_debug_log(result: dict, history_dir: Path) -> None:
 
     entry = _build_entry(result)
     logger.info(
-        "Discovery result | protocol=%s switch=%s ip=%s port=%s vlan=%s voice=%s",
+        "Discovery result | protocol=%s switch=%s ip=%s port=%s desc=%s vlan=%s voice=%s",
         entry["protocol"],
         entry["switch_name"],
         entry["switch_ip"],
         entry["port"],
+        entry["port_desc"],
         entry["vlan"],
         entry["voice_vlan"],
     )
@@ -268,7 +270,7 @@ def record(result: dict) -> None:
 
     Parameters:
         result : the neighbor dict returned by race.run(), containing
-                 protocol, switch_name, switch_ip, port, vlan, voice_vlan
+                 protocol, switch_name, switch_ip, port, port_desc, vlan, voice_vlan
 
     Modes:
         0 — Off:          returns immediately, no disk activity

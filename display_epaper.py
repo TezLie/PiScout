@@ -391,7 +391,7 @@ class EPaperDisplay:
 
     def _important_fields_changed(self, new_lines):
         """
-        Check whether VLAN (index 3) changed.
+        Check whether VLAN (index 4) changed.
 
         This field triggers an immediate refresh, bypassing the normal
         minimum refresh interval, so the technician sees changes right away.
@@ -399,7 +399,7 @@ class EPaperDisplay:
         if self.last_lines is None:
             return True
 
-        return self.last_lines[3] != new_lines[3]
+        return self.last_lines[4] != new_lines[4]
 
     def _refresh_allowed(self):
         """

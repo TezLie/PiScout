@@ -113,6 +113,7 @@ def build_display_lines(neighbor: dict) -> list[str]:
         f"SW: {_truncate(neighbor.get('switch_name', 'Unknown'), 18)}",
         f"IP: {_truncate(neighbor.get('switch_ip',   'Unknown'), 18)}",
         f"PORT: {_truncate(neighbor.get('port',       'Unknown'), 16)}",
+        f"DESC: {_truncate(neighbor.get('port_desc',  'Unknown'), 16)}",
         f"VLAN: {neighbor.get('vlan', 'Unknown')}",
     ]
 

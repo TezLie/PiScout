@@ -268,6 +268,7 @@ def parse_cdp_frame(frame: bytes) -> dict[str, str]:
         switch_name : switch hostname (domain stripped)
         switch_ip   : management IP address
         port        : remote switch port name (shortened)
+        port_desc   : always "" (CDP does not advertise a port description)
         vlan        : native/access VLAN ID as a string
         voice_vlan  : voice VLAN ID as a string
 
@@ -277,6 +278,7 @@ def parse_cdp_frame(frame: bytes) -> dict[str, str]:
         "switch_name": "",
         "switch_ip":   "",
         "port":        "",
+        "port_desc":   "",
         "vlan":        "",
         "voice_vlan":  "",
     }

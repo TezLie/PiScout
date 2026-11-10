@@ -28,7 +28,7 @@ from parse_utils import normalize_display_lines, shorten_interface_name
 
 
 # Index of the PORT line within the body lines passed to show_lines.
-# SW=0, IP=1, PORT=2, VLAN=3
+# SW=0, IP=1, PORT=2, DESC=3, VLAN=4
 _PORT_LINE_INDEX = 2
 
 

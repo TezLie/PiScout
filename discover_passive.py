@@ -134,14 +134,17 @@ def _normalize(parsed: dict, protocol_label: str) -> dict:
     before being shown, giving the switch time to re-advertise with more
     complete data.
     """
+    port = parse_utils.shorten_interface_name(str(parsed.get("port", "")).strip())
+
     result = {
         "protocol":    protocol_label,
         "switch_name": parse_utils.strip_domain(
                            str(parsed.get("switch_name", "")).strip()
                        ),
         "switch_ip":   str(parsed.get("switch_ip",   "")).strip(),
-        "port":        parse_utils.shorten_interface_name(
-                           str(parsed.get("port", "")).strip()
+        "port":        port,
+        "port_desc":   parse_utils.clean_port_description(
+                           parsed.get("port_desc", ""), port
                        ),
         "vlan":        parse_utils.normalize_vlan_value(
                            str(parsed.get("vlan", ""))

@@ -144,45 +144,40 @@ def _extract_switch_name(tlvs: dict[int, list[bytes]]) -> str:
     return strip_domain(name)
 
 
-def _extract_port(tlvs: dict[int, list[bytes]]) -> str:
+def _extract_port(tlvs: dict[int, list[bytes]]) -> tuple[str, str]:
     """
-    Extract the remote switch port name.
+    Extract the remote switch port name and port description.
 
-    Priority:
-        1. Port Description (type 4) — often contains the full interface
-           name such as "GigabitEthernet1/0/24" on Cisco switches.
-        2. Port ID (type 2) subtype 5 (interface name) or 7 (locally
-           assigned) — the standardized interface identifier.
-        3. Port ID any other string subtype — last resort.
+    Returns (port_name, port_description).
 
-    MAC-address Port IDs are skipped because a MAC is not a useful
-    port label for a field technician.
+    Port name comes from Port ID (type 2), e.g. "Gi1/0/24" (subtype 5,
+    interface name) or "24" (subtype 7, locally assigned).
+
+    Port description comes from Port Description (type 4). Depending on the
+    switch this is either the configured interface description (e.g.
+    "Room 214 desk") or just the full interface name again.
+
+    MAC-address Port IDs are skipped because a MAC is not a useful port
+    label for a field technician. In that case the description is used as
+    the port name so the result still has a port.
     """
-    # Port Description (type 4)
+    description = ""
     descr_values = tlvs.get(_TLV_PORT_DESCR, [])
     if descr_values:
-        descr = _decode_string(descr_values[0])
-        if descr:
-            return shorten_interface_name(descr)
+        description = _decode_string(descr_values[0])
 
-    # Port ID (type 2)
+    name = ""
     port_values = tlvs.get(_TLV_PORT_ID, [])
-    if not port_values:
-        return ""
+    if port_values and len(port_values[0]) >= 2:
+        subtype = port_values[0][0]
+        data    = port_values[0][1:]
+        if subtype != _PORT_SUBTYPE_MAC:
+            name = _decode_string(data)
 
-    value   = port_values[0]
-    if len(value) < 2:
-        return ""
+    if not name:
+        return shorten_interface_name(description), ""
 
-    subtype = value[0]
-    data    = value[1:]
-
-    # Skip MAC-based Port IDs — not useful on screen.
-    if subtype == _PORT_SUBTYPE_MAC:
-        return ""
-
-    port = _decode_string(data)
-    return shorten_interface_name(port)
+    return shorten_interface_name(name), description
 
 
 def _extract_management_ip(tlvs: dict[int, list[bytes]]) -> str:
@@ -286,6 +281,7 @@ def parse_lldp_frame(frame: bytes) -> dict[str, str]:
         switch_name : switch hostname (domain stripped)
         switch_ip   : management IP address
         port        : remote switch port name (shortened)
+        port_desc   : remote switch port description (may be empty)
         vlan        : access/data VLAN ID as a string
         voice_vlan  : voice VLAN ID as a string
 
@@ -295,6 +291,7 @@ def parse_lldp_frame(frame: bytes) -> dict[str, str]:
         "switch_name": "",
         "switch_ip":   "",
         "port":        "",
+        "port_desc":   "",
         "vlan":        "",
         "voice_vlan":  "",
     }
@@ -312,7 +309,7 @@ def parse_lldp_frame(frame: bytes) -> dict[str, str]:
 
     result["switch_name"] = _extract_switch_name(tlvs)
     result["switch_ip"]   = _extract_management_ip(tlvs)
-    result["port"]        = _extract_port(tlvs)
+    result["port"], result["port_desc"] = _extract_port(tlvs)
 
     vlan, voice_vlan      = _extract_vlan_and_voice(tlvs)
     result["vlan"]        = vlan

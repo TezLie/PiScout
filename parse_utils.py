@@ -119,6 +119,22 @@ def shorten_interface_name(port_name: str) -> str:
     return port_name
 
 
+def clean_port_description(description: str, port_name: str) -> str:
+    """
+    Return the port description, or "" if it only repeats the port name.
+
+    Many switches fall back to sending the interface name (e.g.
+    "GigabitEthernet1/0/24") as the port description when no description
+    is configured. That adds nothing next to the PORT line, so it is dropped.
+    """
+    description = " ".join(str(description or "").split())
+    if not description:
+        return ""
+    if shorten_interface_name(description).lower() == str(port_name or "").strip().lower():
+        return ""
+    return description
+
+
 def normalize_vlan_value(vlan_value: str) -> str:
     """
     Clean up a VLAN string and extract a plain numeric value.
