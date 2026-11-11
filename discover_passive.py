@@ -4,9 +4,9 @@ discover_passive.py
 Passive LLDP and CDP neighbor discovery via raw Ethernet frame capture.
 
 Listens on a raw AF_PACKET socket for LLDP and CDP frames broadcast by the
-connected switch. Returns the first valid result as a normalized neighbor dict.
+connected switch and turns each valid frame into a normalized neighbor dict.
 
-This is the fallback discovery path used when SNMP is unavailable or slow.
+race.py runs this alongside SNMP; main.py merges the results.
 On LLDP-capable switches it typically returns results in 3-8 seconds.
 On CDP-only Cisco switches it may take 20-60 seconds depending on where
 the switch is in its advertisement cycle.
@@ -16,10 +16,11 @@ What this file does:
 - Listen for incoming LLDP and CDP frames
 - Filter out self-generated trigger frames by source MAC
 - Parse frames using parse_lldp_raw and parse_cdp_raw
-- Return the first valid result as a normalized dict
+- Report every valid result (listen) or return the first one (discover)
 
 What this file does NOT do:
 - Send trigger frames (race.py sends triggers before starting threads)
+- Combine results from different protocols (main.py does that)
 - Talk to the display
 - Manage session state
 - Call SNMP or perform any active network queries
@@ -30,7 +31,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
-from typing import Optional
+from typing import Callable, Optional
 
 import capture_raw
 import parse_cdp_raw
@@ -167,22 +168,50 @@ def discover(
     """
     Listen for LLDP or CDP frames and return the first valid result.
 
+    Used by main.py's background refresh. Returns as soon as a valid frame
+    is received, or None if the cancel_event is set or the timeout expires.
+
+    Parameters are the same as listen(), minus on_result.
+
+    Returns:
+        Normalized neighbor dict or None.
+    """
+    found: list[dict] = []
+
+    def _keep_first(result: dict) -> bool:
+        found.append(result)
+        return True   # stop listening
+
+    listen(interface, local_mac, cancel_event, _keep_first, timeout, socket_ready)
+    return found[0] if found else None
+
+
+def listen(
+    interface:    str,
+    local_mac:    Optional[bytes],
+    cancel_event: threading.Event,
+    on_result:    Callable[[dict], bool],
+    timeout:      float = 180.0,
+    socket_ready: Optional[threading.Event] = None,
+) -> None:
+    """
+    Listen for LLDP and CDP frames and pass every valid result to on_result.
+
     This is a blocking call intended to run inside a thread managed by
-    race.py. It returns as soon as a valid frame is received, or None
-    if the cancel_event is set or the timeout expires.
+    race.py. It keeps listening until on_result returns True, the
+    cancel_event is set, or the timeout expires.
 
     Parameters:
         interface    : Ethernet interface name, e.g. "eth0"
         local_mac    : 6-byte MAC address used to filter self-generated frames
-        cancel_event : set by race.py when another discovery method wins
-        timeout      : maximum seconds to wait before returning None
+        cancel_event : set by the caller to stop listening
+        on_result    : called with each normalized neighbor dict; return
+                       True to stop listening
+        timeout      : maximum seconds to listen
         socket_ready : optional event set after the raw socket is opened.
                        race.py waits on this before sending trigger frames
                        so no frames are missed due to the race condition where
                        a switch responds before our socket is open.
-
-    Returns:
-        Normalized neighbor dict or None.
     """
     receive_timeout = _get_receive_timeout()
     deadline        = time.monotonic() + timeout
@@ -193,7 +222,7 @@ def discover(
         # Signal ready even on failure so race.py does not hang waiting.
         if socket_ready is not None:
             socket_ready.set()
-        return None
+        return
 
     # Signal that the socket is open and listening.
     # race.py waits on this before sending triggers so frames sent by the
@@ -243,14 +272,14 @@ def discover(
                 result["vlan"],
                 result["voice_vlan"],
             )
-            return result
+            if on_result(result):
+                return
 
         log.debug(
             "Passive discovery ended on %s (%s)",
             interface,
             "cancelled" if cancel_event.is_set() else "timeout",
         )
-        return None
 
     finally:
         raw_cap.close()

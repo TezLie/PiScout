@@ -6,14 +6,16 @@ PiScout — entry point and main loop.
 Monitors Ethernet carrier state, runs the discovery race on link-up,
 and updates the e-paper display with switch port information.
 
-Discovery is handled entirely by race.py, which runs SNMP and passive
-LLDP/CDP capture in parallel and returns the fastest result.
+Discovery is handled by race.py, which runs SNMP and passive LLDP/CDP
+capture in parallel and reports each result as it arrives. The first
+result is drawn straight away; later ones are merged in field by field
+(SNMP first, then LLDP, then CDP) and the screen is updated.
 
 What this file does:
 - Initialize the display
 - Monitor link state on the configured interface
 - Show appropriate screens (waiting, scanning, result, stale)
-- Call race.run() on link-up and feed results to the display
+- Call race.run() on link-up, merge results and feed them to the display
 - Handle SIGTERM gracefully for clean shutdown
 
 What this file does NOT do:
@@ -107,6 +109,10 @@ def _truncate(text: str, max_len: int) -> str:
     return text if len(text) <= max_len else text[: max_len - 1] + "…"
 
 
+# Neighbor field shown on each body line, in display order.
+_LINE_FIELDS = ("switch_name", "switch_ip", "port", "port_desc", "vlan")
+
+
 def build_display_lines(neighbor: dict) -> list[str]:
     """Build the body lines for a valid neighbor result."""
     return [
@@ -116,6 +122,12 @@ def build_display_lines(neighbor: dict) -> list[str]:
         f"DESC: {_truncate(neighbor.get('port_desc',  'Unknown'), 16)}",
         f"VLAN: {neighbor.get('vlan', 'Unknown')}",
     ]
+
+
+def build_display_sources(neighbor: dict) -> list[str]:
+    """Protocol that supplied each body line, shown at the end of the line."""
+    sources = neighbor.get("sources", {})
+    return [sources.get(field, "") for field in _LINE_FIELDS]
 
 
 def build_scanning_lines() -> list[str]:
@@ -133,21 +145,42 @@ def build_stale_lines() -> list[str]:
     return ["", "No active", "neighbor data.", "", ""]
 
 
-def _show(display, lines: list[str], force: bool = False, protocol: str = "") -> bool:
+def _show(display, lines: list[str], force: bool = False, sources: Optional[list[str]] = None) -> bool:
     """
     Show lines on whichever display is connected.
 
-    Wraps the display's show_lines method and passes the optional
-    protocol string for the top-corner indicator. Falls back gracefully
-    if the display driver does not support the protocol parameter.
+    sources is an optional list, parallel to lines, naming the protocol
+    that supplied each line. It is drawn at the end of the line.
     """
     try:
-        return display.show_lines(lines, force=force, protocol=protocol)
-    except TypeError:
-        return display.show_lines(lines, force=force)
+        return display.show_lines(lines, force=force, sources=sources)
     except Exception as exc:
         log.error("Display update failed: %s", exc)
         return False
+
+
+def _screen_content(neighbor: Optional[dict]) -> Optional[tuple]:
+    """What a neighbor result looks like on screen, for change detection."""
+    if neighbor is None:
+        return None
+    return (build_display_lines(neighbor), build_display_sources(neighbor))
+
+
+def _show_result(display, neighbor: dict, reason: str) -> None:
+    """Draw a merged neighbor result and log it."""
+    display.set_startup_mode(False)
+    _show(display, build_display_lines(neighbor), force=True, sources=build_display_sources(neighbor))
+    log.info(
+        "%s | protocol=%s switch=%s ip=%s port=%s desc=%s vlan=%s voice=%s",
+        reason,
+        neighbor.get("protocol"),
+        neighbor.get("switch_name"),
+        neighbor.get("switch_ip"),
+        neighbor.get("port"),
+        neighbor.get("port_desc"),
+        neighbor.get("vlan"),
+        neighbor.get("voice_vlan"),
+    )
 
 
 # ============================================================
@@ -314,219 +347,135 @@ def run() -> None:
         # cancel_event is set when link goes down or shutdown fires.
         cancel_event = threading.Event()
 
-        # Run the discovery race in a background thread so we can
-        # simultaneously monitor carrier state.
-        result_holder: list[Optional[dict]] = [None]
+        # ---- Session state shared with the discovery thread ----
+        # Results arrive one protocol at a time. Each one is merged into the
+        # latest result per protocol (SNMP > LLDP > CDP per field) and the
+        # screen is updated whenever what it shows changes.
+        lock            = threading.Lock()
+        by_protocol:    dict[str, dict]           = {}
+        current_result: list[Optional[dict]]      = [None]
+        first_result_at: list[Optional[float]]    = [None]
+        last_success_ts = [time.monotonic()]
+        stale_shown     = [False]
+        displayed       = threading.Event()   # first result has been drawn
+        race_done       = threading.Event()   # initial discovery finished
 
-        def _race_thread():
-            result_holder[0] = race.run(
+        def _on_result(fresh: dict) -> None:
+            """Merge one protocol's result and update the screen if it changed."""
+            with lock:
+                last_success_ts[0] = time.monotonic()
+                protocol = fresh.get("protocol", "?")
+                by_protocol[protocol] = race.keep_better(by_protocol.get(protocol), fresh)
+                merged = race.merge_results(by_protocol)
+
+                prev = current_result[0]
+                current_result[0] = merged
+                if first_result_at[0] is None:
+                    first_result_at[0] = time.monotonic()
+
+                # Until the first draw, the main loop below decides when to show.
+                if not displayed.is_set():
+                    return
+
+                screen_changed = _screen_content(merged) != _screen_content(prev)
+                if not (screen_changed or stale_shown[0]):
+                    return
+
+                is_upgrade = prev["is_partial"] and not merged["is_partial"]
+                _show_result(display, merged, f"Display updated with {protocol}")
+                stale_shown[0] = False
+                if is_upgrade:
+                    history.record(merged)
+
+        def _discovery_thread():
+            # Initial discovery: SNMP, LLDP and CDP in parallel, each result
+            # passed to _on_result as soon as it arrives.
+            race.run(
                 interface=interface,
                 local_mac=local_mac,
                 cancel_event=cancel_event,
+                on_result=_on_result,
                 timeout=disc_timeout,
             )
+            race_done.set()
 
-        race_thread = threading.Thread(
-            target=_race_thread,
-            name="rf-race",
-            daemon=True,
-        )
-        race_thread.start()
+            with lock:
+                if current_result[0] is not None:
+                    history.record(current_result[0])
 
-        # Monitor carrier while the race runs.
-        while not shutdown_event.is_set():
-            if not _read_carrier(interface):
-                log.info("Link lost on %s — cancelling discovery", interface)
-                cancel_event.set()
-                break
-
-            if not race_thread.is_alive():
-                break  # Race finished
-
-            _wait_or_shutdown(shutdown_event, 0.5)
-
-        # Wait for the race thread to finish (it will exit quickly once
-        # cancel_event is set or when it completes naturally).
-        race_thread.join(timeout=5.0)
-        cancel_event.set()  # Ensure all threads stop
-
-        if shutdown_event.is_set():
-            break
-
-        result = result_holder[0]
-
-        if not _read_carrier(interface):
-            # Link went down while we were waiting — go back to top of loop.
-            _show(display, build_waiting_for_link_lines(), force=True)
-            continue
-
-        if result is None:
-            # Discovery timed out with link still up.
-            log.info("Discovery timed out on %s", interface)
-            _show(display, build_stale_lines(), force=True)
-            # Stay on stale screen until link drops.
-            while _read_carrier(interface) and not shutdown_event.is_set():
-                _wait_or_shutdown(shutdown_event, 1.0)
-            continue
-
-        # ---- We have a result (may be partial) ----
-        is_partial   = result.get("is_partial", False)
-        result_at    = time.monotonic()
-        displayed    = False
-
-        if is_partial:
-            log.info(
-                "Partial result from race | protocol=%s switch=%s port=%s vlan=%s",
-                result.get("protocol"),
-                result.get("switch_name"),
-                result.get("port"),
-                result.get("vlan"),
-            )
-        else:
-            # Complete result — enforce normal reveal delay then show immediately.
-            elapsed = time.monotonic() - scan_drawn_at
-            if elapsed < reveal_delay:
-                _wait_or_shutdown(shutdown_event, reveal_delay - elapsed)
-
-            if not shutdown_event.is_set():
-                protocol = result.get("protocol", "")
-                display.set_startup_mode(False)
-                _show(display, build_display_lines(result), force=True, protocol=protocol)
-                displayed = True
-                history.record(result)
-                log.info(
-                    "Display updated | protocol=%s switch=%s ip=%s port=%s vlan=%s voice=%s",
-                    protocol,
-                    result.get("switch_name"),
-                    result.get("switch_ip"),
-                    result.get("port"),
-                    result.get("vlan"),
-                    result.get("voice_vlan"),
-                )
-
-        if shutdown_event.is_set():
-            break
-
-        # ---- Monitor link while showing result ----
-        # Background passive listener serves three purposes:
-        # 1. Resets the stale timer on every switch re-advertisement
-        # 2. Upgrades display from partial to complete when more data arrives
-        # 3. Updates display if switch data changes (e.g. VLAN reassignment)
-        refresh_cancel  = threading.Event()
-        last_success_ts = [time.monotonic()]
-        current_result  = [result]
-        stale_shown     = False
-
-        def _passive_refresh():
-            while not shutdown_event.is_set() and not refresh_cancel.is_set():
+            # Keep listening for LLDP/CDP for the rest of the session. This
+            # resets the stale timer, fills in fields that were missing, and
+            # picks up changes such as a VLAN reassignment.
+            while not cancel_event.is_set() and not shutdown_event.is_set():
                 fresh = discover_passive.discover(
                     interface=interface,
                     local_mac=local_mac,
-                    cancel_event=refresh_cancel,
+                    cancel_event=cancel_event,
                     timeout=disc_timeout,
                 )
-                if not fresh or refresh_cancel.is_set():
-                    continue
+                if fresh and not cancel_event.is_set():
+                    _on_result(fresh)
 
-                last_success_ts[0] = time.monotonic()
-                log.debug(
-                    "Passive refresh | protocol=%s switch=%s port=%s partial=%s",
-                    fresh.get("protocol"),
-                    fresh.get("switch_name"),
-                    fresh.get("port"),
-                    fresh.get("is_partial"),
-                )
-
-                prev = current_result[0]
-                is_upgrade = prev.get("is_partial") and not fresh.get("is_partial")
-                data_changed = fresh != prev
-
-                if is_upgrade or data_changed:
-                    current_result[0] = fresh
-                    _show(
-                        display,
-                        build_display_lines(fresh),
-                        force=True,
-                        protocol=fresh.get("protocol", ""),
-                    )
-                    if is_upgrade:
-                        history.record(fresh)
-                    log.info(
-                        "Display %s | protocol=%s switch=%s port=%s vlan=%s voice=%s",
-                        "upgraded from partial" if is_upgrade else "refreshed",
-                        fresh.get("protocol"),
-                        fresh.get("switch_name"),
-                        fresh.get("port"),
-                        fresh.get("vlan"),
-                        fresh.get("voice_vlan"),
-                    )
-
-        refresh_thread = threading.Thread(
-            target=_passive_refresh,
-            name="rf-passive-refresh",
+        discovery_thread = threading.Thread(
+            target=_discovery_thread,
+            name="rf-discovery",
             daemon=True,
         )
-        refresh_thread.start()
+        discovery_thread.start()
 
+        # ---- Monitor link and decide when to draw ----
         while not shutdown_event.is_set():
             if not _read_carrier(interface):
-                log.info("Link lost on %s", interface)
-                refresh_cancel.set()
-                refresh_thread.join(timeout=3.0)
+                log.info("Link lost on %s — stopping discovery", interface)
+                cancel_event.set()
+                discovery_thread.join(timeout=5.0)
                 display.set_startup_mode(True)
                 _show(display, build_waiting_for_link_lines(), force=True)
                 break
 
-            # If result was partial and not yet displayed, check the timer.
-            # Show partial data after PARTIAL_DISPLAY_DELAY even if we still
-            # haven't received a complete result — something is better than nothing.
-            if not displayed:
-                partial_elapsed = time.monotonic() - result_at
-                if partial_elapsed >= partial_display_delay:
-                    best = current_result[0]
-                    protocol = best.get("protocol", "")
-                    display.set_startup_mode(False)
-                    _show(display, build_display_lines(best), force=True, protocol=protocol)
-                    displayed = True
-                    history.record(best)
+            now = time.monotonic()
+            with lock:
+                best = current_result[0]
+
+                # First draw. A complete result is shown as soon as the
+                # "Scanning..." screen has been up for reveal_delay seconds.
+                # A partial result (switch name or port missing) is held for
+                # PARTIAL_DISPLAY_DELAY seconds in case another protocol
+                # fills the gap — something is better than nothing after that.
+                if best is not None and not displayed.is_set():
+                    if not best["is_partial"]:
+                        if now - scan_drawn_at >= reveal_delay:
+                            _show_result(display, best, "Display updated")
+                            displayed.set()
+                    elif now - first_result_at[0] >= partial_display_delay:
+                        _show_result(
+                            display,
+                            best,
+                            f"Partial result displayed after {now - first_result_at[0]:.0f}s delay",
+                        )
+                        displayed.set()
+
+                # Nothing found at all: show the stale screen. Discovery keeps
+                # listening, so a late LLDP/CDP frame still gets drawn.
+                if best is None and race_done.is_set() and not stale_shown[0]:
+                    log.info("Discovery timed out on %s", interface)
+                    _show(display, build_stale_lines(), force=True)
+                    stale_shown[0] = True
+
+                # Shown data has not been re-advertised within the timeout.
+                stale_elapsed = now - last_success_ts[0]
+                if displayed.is_set() and not stale_shown[0] and stale_elapsed > disc_timeout:
                     log.info(
-                        "Partial result displayed after %.0fs delay | "
-                        "switch=%s port=%s vlan=%s",
-                        partial_elapsed,
-                        best.get("switch_name"),
-                        best.get("port"),
-                        best.get("vlan"),
+                        "Neighbor data stale on %s (%.0fs since last success)",
+                        interface,
+                        stale_elapsed,
                     )
-                elif current_result[0] != result and not current_result[0].get("is_partial"):
-                    # Background refresh already got a complete result — show it now.
-                    best = current_result[0]
-                    protocol = best.get("protocol", "")
-                    display.set_startup_mode(False)
-                    _show(display, build_display_lines(best), force=True, protocol=protocol)
-                    displayed = True
-                    history.record(best)
-                    log.info(
-                        "Complete result arrived during partial wait | "
-                        "switch=%s port=%s vlan=%s",
-                        best.get("switch_name"),
-                        best.get("port"),
-                        best.get("vlan"),
-                    )
+                    _show(display, build_stale_lines(), force=True)
+                    stale_shown[0] = True
 
-            # Show stale warning if no refreshed data within timeout window.
-            stale_elapsed = time.monotonic() - last_success_ts[0]
-            if not stale_shown and stale_elapsed > disc_timeout:
-                log.info(
-                    "Neighbor data stale on %s (%.0fs since last success)",
-                    interface,
-                    stale_elapsed,
-                )
-                _show(display, build_stale_lines(), force=True)
-                stale_shown = True
+            _wait_or_shutdown(shutdown_event, 0.25)
 
-            _wait_or_shutdown(shutdown_event, 1.0)
-
-        refresh_cancel.set()
+        cancel_event.set()
 
     # ---- Graceful shutdown ----
     log.info("Shutting down PiScout")

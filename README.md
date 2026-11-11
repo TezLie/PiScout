@@ -21,7 +21,7 @@ The goal was to build a practical, open-source alternative to expensive commerci
 - Powered by PoE or USB power bank — no separate power supply needed
 - Multi-path parallel discovery: SNMP, LLDP, and CDP run simultaneously
 - Displays switch hostname, IP, port, access VLAN, and voice VLAN
-- Protocol indicator shows which discovery method produced the result
+- Each line shows which discovery method (SNMP, LLDP or CDP) supplied its value
 - Handles partial results — displays available data even when some fields are missing
 - Compatible with Cisco (CDP/LLDP), FortiSwitch, and any LLDP-capable switch
 - Low-power e-Paper display retains image with zero power draw
@@ -37,13 +37,13 @@ The goal was to build a practical, open-source alternative to expensive commerci
 ## Display Output
 
 ```text
-           PiScout              CDP
+           PiScout
 ─────────────────────────────────
-SW: SWITCH-01
-IP: 10.10.1.2
-PORT: Gi1/0/24
-DESC: Room 214 desk
-VLAN: 120
+SW: SWITCH-01                SNMP
+IP: 10.10.1.2                SNMP
+PORT: Gi1/0/24               SNMP
+DESC: Room 214 desk          LLDP
+VLAN: 120                    SNMP
 ```
 
 ---
@@ -88,7 +88,7 @@ A raw AF_PACKET socket listens for IEEE 802.1AB LLDP frames broadcast by the swi
 **CDP Passive Capture (fallback)**
 A raw AF_PACKET socket listens for Cisco Discovery Protocol frames. A persistent stream of CDP trigger frames is sent throughout the discovery window to maximise the chance of catching the switch's polling cycle. On Cisco CDP-only environments, typical response time is 10-30 seconds.
 
-The first method to return a valid result wins and its data is shown on the display immediately. The others are cancelled. After the initial result is displayed, a background listener continues receiving switch advertisements to keep the data fresh and detect any changes.
+The first valid result is shown on the display immediately. The other methods keep running, and each result that arrives later is merged in and the display updated. Results are combined field by field: each value is taken from **SNMP** if it has one, otherwise **LLDP**, otherwise **CDP**. After discovery finishes, a background listener continues receiving switch advertisements to keep the data fresh and detect any changes.
 
 ### Partial Results
 
@@ -104,7 +104,7 @@ The following information is shown on the e-Paper display:
 - **DESC** — Description configured on the switch port (blank if none; CDP never provides one)
 - **VLAN** — Access VLAN
 
-A small protocol indicator in the top-right corner shows which discovery method produced the result: **SNMP**, **LLDP**, or **CDP**.
+The discovery method that supplied each value (**SNMP**, **LLDP**, or **CDP**) is shown in small text at the end of its line.
 
 ### Link Loss
 
@@ -376,7 +376,7 @@ sudo systemctl restart piscout.service
 No history is recorded. No disk writes from application data. Recommended for normal use and fully compatible with the read-only filesystem.
 
 **Mode 1 — Port History**
-Records the last `PORT_HISTORY_LIMIT` port discovery results (default 50) to `/data/piscout/history.jsonl`. Each entry contains a timestamp, the discovery protocol used, and all switch data. Oldest entries are automatically dropped when the limit is reached.
+Records the last `PORT_HISTORY_LIMIT` port discovery results (default 50) to `/data/piscout/history.jsonl`. Each entry contains a timestamp, the discovery protocols that contributed (e.g. `SNMP+LLDP`), and all switch data. Oldest entries are automatically dropped when the limit is reached.
 
 **Mode 2 — Debug Log**
 Writes verbose rotating log entries to `/data/piscout/debug.log`. The file rotates at 5MB and three backups are kept. Useful for field troubleshooting without a live SSH session.
@@ -407,7 +407,7 @@ Example output:
 ```json
 {
   "timestamp": "2026-04-30 15:18:09",
-  "protocol": "LLDP",
+  "protocol": "SNMP+LLDP",
   "switch_name": "S4-TENFLO-MDF",
   "switch_ip": "10.126.0.4",
   "port": "Gi1/0/31",

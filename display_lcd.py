@@ -5,7 +5,8 @@ This file only handles the Waveshare 1.44" LCD HAT display.
 
 What this file does:
 - Start the LCD display
-- Draw text onto an image
+- Draw text onto an image, each line with the protocol that supplied it
+  (SNMP/LLDP/CDP) at its right end
 - Show that image on the screen
 - Keep the backlight on during normal operation
 - Optionally clear the screen
@@ -45,6 +46,10 @@ class LCDDisplay:
     BASE_FONT_SIZE = 14
     MIN_FONT_SIZE  = 8
     LINE_SPACING   = 2
+
+    # Protocol tag drawn at the right end of a body line.
+    SOURCE_FONT_SIZE = 8
+    SOURCE_GAP       = 3   # pixels between line text and tag
 
     # Default font file.
     DEFAULT_FONT_PATH = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
@@ -99,8 +104,9 @@ class LCDDisplay:
         self.initialized  = False
         self.backlight_on = False
 
-        # Save the last 5 lines shown on screen.
-        self.last_lines = None
+        # Save the last 5 lines and their sources shown on screen.
+        self.last_lines   = None
+        self.last_sources = None
 
         # LCD driver object gets created during initialize().
         self.lcd = None
@@ -170,7 +176,8 @@ class LCDDisplay:
             )
 
             self._show_image(image)
-            self.last_lines = ["", "", "", "", "", ""]
+            self.last_lines   = ["", "", "", "", "", ""]
+            self.last_sources = ["", "", "", "", "", ""]
 
     def set_startup_mode(self, enabled):
         """
@@ -183,12 +190,16 @@ class LCDDisplay:
         """
         pass
 
-    def show_lines(self, lines, force=False, protocol=""):
+    def show_lines(self, lines, force=False, sources=None):
         """
         Show text on the LCD display.
 
         lines:
             A list of up to 5 text lines to show on the screen.
+
+        sources:
+            Optional list parallel to lines naming the protocol that supplied
+            each line ("SNMP", "LLDP", "CDP" or ""). Drawn at the line's end.
 
         force:
             If True, redraw even if the text did not change.
@@ -200,16 +211,22 @@ class LCDDisplay:
         with self.lock:
             self._ensure_initialized()
 
-            normalized_lines = normalize_display_lines(lines)
-            prepared_lines   = self._prepare_lines_for_lcd(normalized_lines)
+            normalized_lines   = normalize_display_lines(lines)
+            normalized_sources = [s.upper()[:4] for s in normalize_display_lines(sources or [])]
+            prepared_lines     = self._prepare_lines_for_lcd(normalized_lines, normalized_sources)
 
-            if not force and prepared_lines == self.last_lines:
+            if (
+                not force
+                and prepared_lines == self.last_lines
+                and normalized_sources == self.last_sources
+            ):
                 return False
 
-            image = self._render_image(prepared_lines)
+            image = self._render_image(prepared_lines, normalized_sources)
             self._show_image(image)
 
-            self.last_lines = prepared_lines
+            self.last_lines   = prepared_lines
+            self.last_sources = normalized_sources
             self._set_backlight(True)
 
             return True
@@ -242,21 +259,29 @@ class LCDDisplay:
             self.initialized  = False
             self.backlight_on = False
 
-    def _render_image(self, lines):
+    def _render_image(self, lines, sources):
         """
         Turn the text lines into an RGB image that fits the screen.
+
+        Each line's source tag is drawn right-aligned at the end of the line.
         """
         image = Image.new(
             "RGB",
             (self.DISPLAY_WIDTH, self.DISPLAY_HEIGHT),
             self.background_color,
         )
-        draw = ImageDraw.Draw(image)
-        font = self._choose_font(draw, lines)
-        y    = self.TOP_MARGIN
+        draw        = ImageDraw.Draw(image)
+        font        = self._choose_font(draw, lines, sources)
+        source_font = self._get_font(self.SOURCE_FONT_SIZE)
+        right_edge  = self.DISPLAY_WIDTH - self.LEFT_MARGIN
+        y           = self.TOP_MARGIN
 
-        for line in lines:
+        for line, source in zip(lines, sources):
             draw.text((self.LEFT_MARGIN, y), line, font=font, fill=self.text_color)
+            if source:
+                # Put the smaller tag on the same baseline as the line text.
+                baseline = y + font.getmetrics()[0]
+                draw.text((right_edge, baseline), source, font=source_font, fill=self.text_color, anchor="rs")
             bbox        = draw.textbbox((0, 0), line, font=font)
             line_height = bbox[3] - bbox[1]
             y += line_height + self.LINE_SPACING
@@ -273,7 +298,17 @@ class LCDDisplay:
         self._ensure_initialized()
         self.lcd.LCD_ShowImage(image, 0, 0)
 
-    def _prepare_lines_for_lcd(self, lines):
+    def _source_width(self, draw, source):
+        """Width in pixels reserved for a source tag, including the gap before it."""
+        if not source:
+            return 0
+        return int(draw.textlength(source, font=self._get_font(self.SOURCE_FONT_SIZE))) + self.SOURCE_GAP
+
+    def _text_width_for(self, draw, source):
+        """Usable width for a line's text after reserving room for its source tag."""
+        return self.DISPLAY_WIDTH - (self.LEFT_MARGIN * 2) - self._source_width(draw, source)
+
+    def _prepare_lines_for_lcd(self, lines, sources):
         """
         Adapt lines for the small 128x128 LCD screen.
 
@@ -288,19 +323,20 @@ class LCDDisplay:
         draw = ImageDraw.Draw(
             Image.new("RGB", (self.DISPLAY_WIDTH, self.DISPLAY_HEIGHT), self.background_color)
         )
-        font        = self._get_font(self.MIN_FONT_SIZE)
-        usable_width = self.DISPLAY_WIDTH - (self.LEFT_MARGIN * 2)
+        font = self._get_font(self.MIN_FONT_SIZE)
 
         prepared = []
 
-        for index, line in enumerate(lines):
+        for index, (line, source) in enumerate(zip(lines, sources)):
             # Only shorten interface names on the PORT line.
             if index == _PORT_LINE_INDEX:
                 processed = shorten_interface_name(line)
             else:
                 processed = line
 
-            processed = self._truncate_to_width(draw, processed, font, usable_width)
+            processed = self._truncate_to_width(
+                draw, processed, font, self._text_width_for(draw, source)
+            )
             prepared.append(processed)
 
         return prepared
@@ -331,30 +367,30 @@ class LCDDisplay:
 
         return ellipsis
 
-    def _choose_font(self, draw, lines):
+    def _choose_font(self, draw, lines, sources):
         """
         Pick the biggest font size where all lines fit on the screen.
         """
         for size in range(self.BASE_FONT_SIZE, self.MIN_FONT_SIZE - 1, -1):
             font = self._get_font(size)
-            if self._lines_fit(draw, lines, font):
+            if self._lines_fit(draw, lines, sources, font):
                 return font
         return self._get_font(self.MIN_FONT_SIZE)
 
-    def _lines_fit(self, draw, lines, font):
+    def _lines_fit(self, draw, lines, sources, font):
         """
-        Check if all lines fit on the screen at the given font size.
+        Check if all lines fit on the screen at the given font size,
+        leaving room for each line's source tag.
         """
-        usable_width  = self.DISPLAY_WIDTH - (self.LEFT_MARGIN * 2)
         usable_height = self.DISPLAY_HEIGHT - self.TOP_MARGIN
         total_height  = 0
 
-        for index, line in enumerate(lines):
+        for index, (line, source) in enumerate(zip(lines, sources)):
             bbox        = draw.textbbox((0, 0), line, font=font)
             text_width  = bbox[2] - bbox[0]
             text_height = bbox[3] - bbox[1]
 
-            if text_width > usable_width:
+            if text_width > self._text_width_for(draw, source):
                 return False
 
             total_height += text_height

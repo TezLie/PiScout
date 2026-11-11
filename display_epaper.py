@@ -5,7 +5,8 @@ This file only handles the Waveshare 2.13" V3 e-paper display.
 
 What this file does:
 - Start the e-paper display
-- Draw a fixed header and 5 body lines onto an image
+- Draw a fixed header and 5 body lines onto an image, each line with
+  the protocol that supplied it (SNMP/LLDP/CDP) at its right end
 - Show that image on the screen using partial or full refresh as appropriate
 - Limit how often the screen refreshes
 - Force a refresh when VLAN changes
@@ -46,6 +47,10 @@ class EPaperDisplay:
     BASE_FONT_SIZE = 14
     MIN_FONT_SIZE  = 10
     LINE_SPACING   = 2
+
+    # Protocol tag drawn at the right end of a body line.
+    SOURCE_FONT_SIZE = 10
+    SOURCE_GAP       = 4   # pixels between line text and tag
 
     # Fixed header drawn at the top of every screen.
     TITLE_TEXT       = "PiScout"
@@ -120,9 +125,9 @@ class EPaperDisplay:
         # Until this is True, every refresh is forced to be a full refresh.
         self._partial_base_ready = False
 
-        # Save the last 5 normalized body lines shown on screen.
-        self.last_lines      = None
-        self._last_protocol  = ""
+        # Save the last 5 normalized body lines and their sources shown on screen.
+        self.last_lines   = None
+        self.last_sources = None
 
         # Save the last refresh time.
         self.last_refresh_time = 0.0
@@ -197,7 +202,7 @@ class EPaperDisplay:
         with self.lock:
             self.startup_mode = bool(enabled)
 
-    def show_lines(self, lines, force=False, protocol=""):
+    def show_lines(self, lines, force=False, sources=None):
         """
         Show 5 body lines on the e-paper display.
 
@@ -208,6 +213,10 @@ class EPaperDisplay:
             A list of up to 5 body text strings to show below the header.
             Missing lines are filled with blank strings.
 
+        sources:
+            Optional list parallel to lines naming the protocol that supplied
+            each line ("SNMP", "LLDP", "CDP" or ""). Drawn at the line's end.
+
         force:
             If True, refresh the display regardless of whether content changed
             or the refresh timer has elapsed.
@@ -217,11 +226,15 @@ class EPaperDisplay:
             False if the update was skipped.
         """
         with self.lock:
-            normalized_lines = normalize_display_lines(lines)
-            protocol_label   = str(protocol).upper().strip()[:4] if protocol else ""
+            normalized_lines   = normalize_display_lines(lines)
+            normalized_sources = [s.upper()[:4] for s in normalize_display_lines(sources or [])]
 
-            # Skip if body text and protocol are identical to what is on screen.
-            if not force and normalized_lines == self.last_lines and protocol_label == self._last_protocol:
+            # Skip if body text and sources are identical to what is on screen.
+            if (
+                not force
+                and normalized_lines == self.last_lines
+                and normalized_sources == self.last_sources
+            ):
                 return False
 
             # VLAN changes always trigger an immediate refresh,
@@ -234,7 +247,7 @@ class EPaperDisplay:
 
             self._ensure_awake()
 
-            image  = self._render_image(normalized_lines, protocol_label)
+            image  = self._render_image(normalized_lines, normalized_sources)
             buffer = self.epd.getbuffer(image)
 
             # Decide between partial and full refresh.
@@ -269,7 +282,7 @@ class EPaperDisplay:
                     self._partial_base_ready   = True
 
             self.last_lines        = normalized_lines
-            self._last_protocol    = protocol_label
+            self.last_sources      = normalized_sources
             self.last_refresh_time = time.monotonic()
 
             if self.auto_sleep and not self.startup_mode:
@@ -312,17 +325,16 @@ class EPaperDisplay:
         except OSError:
             return ImageFont.load_default()
 
-    def _render_image(self, body_lines, protocol=""):
+    def _render_image(self, body_lines, sources):
         """
         Turn the 5 normalized body lines into a display image.
 
         Always draws the fixed "PiScout" header with an underline,
         then renders each body line below it.
 
-        If protocol is provided ("SNMP", "LLDP", or "CDP"), it is drawn
-        in small text to the right of the title on the header row, giving
-        the technician a quick visual cue about which method produced the
-        current result.
+        Each line's source ("SNMP", "LLDP", or "CDP") is drawn in small
+        text right-aligned at the end of that line, so the technician can
+        see which method supplied each value.
 
         A vertical overflow warning is logged if content would exceed the
         panel height, so font size misconfigurations are visible in logs.
@@ -338,15 +350,6 @@ class EPaperDisplay:
 
         draw.text((header_x, header_y), header_text, font=self.title_font, fill=0)
 
-        # Draw protocol indicator (e.g. "SNMP", "LLDP", "CDP") right-aligned
-        # in the header row using a small font so it doesn't crowd the title.
-        if protocol:
-            proto_font  = self.font_cache.get(9, self.font_cache[self.MIN_FONT_SIZE])
-            proto_text  = str(protocol).upper()[:4]
-            proto_width = int(draw.textlength(proto_text, font=proto_font))
-            proto_x     = self.DISPLAY_WIDTH - self.LEFT_MARGIN - proto_width
-            draw.text((proto_x, header_y), proto_text, font=proto_font, fill=0)
-
         header_bbox = draw.textbbox(
             (header_x, header_y), header_text, font=self.title_font
         )
@@ -358,10 +361,12 @@ class EPaperDisplay:
         )
 
         # Body starts below the underline.
-        y         = underline_y + self.TITLE_BODY_GAP
-        max_width = self.DISPLAY_WIDTH - (self.LEFT_MARGIN * 2)
+        y           = underline_y + self.TITLE_BODY_GAP
+        max_width   = self.DISPLAY_WIDTH - (self.LEFT_MARGIN * 2)
+        right_edge  = self.DISPLAY_WIDTH - self.LEFT_MARGIN
+        source_font = self.font_cache[self.SOURCE_FONT_SIZE]
 
-        for line in body_lines:
+        for line, source in zip(body_lines, sources):
             if y >= self.DISPLAY_HEIGHT:
                 log.warning(
                     "Display overflow: y=%d >= DISPLAY_HEIGHT=%d. "
@@ -372,8 +377,20 @@ class EPaperDisplay:
                 )
                 break
 
-            font = self._fit_font_for_line(draw, line, max_width)
+            # Reserve room for the source tag so the line text never overlaps it.
+            text_width = max_width
+            if source:
+                source_width = int(draw.textlength(source, font=source_font))
+                text_width   = max_width - source_width - self.SOURCE_GAP
+
+            font = self._fit_font_for_line(draw, line, text_width)
             draw.text((self.LEFT_MARGIN, y), line, font=font, fill=0)
+
+            if source:
+                # Put the smaller tag on the same baseline as the line text.
+                baseline = y + font.getmetrics()[0]
+                draw.text((right_edge, baseline), source, font=source_font, fill=0, anchor="rs")
+
             y += font.size + self.LINE_SPACING
 
         # Rotate so that the Ethernet port is at the top of the physical device.
